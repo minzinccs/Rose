@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -64,7 +64,7 @@ namespace PenguLoader.Main
 
         public static bool UseSymlink
         {
-            get => GetBool("UseSymlink", false);
+            get => GetBool("UseSymlink", true);
             set => SetBool("UseSymlink", value);
         }
 
