@@ -265,7 +265,7 @@ class MergedMembersTests(unittest.TestCase):
         me.party_state.my_summoner_id = 1
         me.party_state.enabled = True
         friend = member(2, "B", 11, 11002, removed=[1])  # they removed us too
-        relay = SimpleNamespace(members=[member(1, "Me"), friend], connected=True, sent=[])
+        relay = SimpleNamespace(members=[member(1, "Me"), friend], connected=True, sent=[], resume=Mock())
 
         async def send_state(state):
             relay.sent.append(state)
@@ -284,6 +284,224 @@ class MergedMembersTests(unittest.TestCase):
 
         friend["skin"]["removed"] = []  # they paste our token
         self.assertEqual(list(me._merged_members()), [2])
+
+
+class FakeSocket:
+    """Records what the relay sends; yields the room messages given."""
+
+    def __init__(self, incoming=()):
+        self.sent = []
+        self._incoming = list(incoming)
+
+    async def send(self, message):
+        self.sent.append(message)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._incoming:
+            raise StopAsyncIteration
+        return self._incoming.pop(0)
+
+
+class RelayQuietWhenAloneTests(unittest.TestCase):
+    """Every message wakes the room on the relay, which the relay pays for:
+    our state only goes out when someone else is there to get it."""
+
+    def setUp(self):
+        from party.network.ws_relay import PartyRelay
+        self.relay = PartyRelay("a" * 32, 1, "Me")
+        self.socket = FakeSocket()
+        self.relay._ws = self.socket
+        self.relay._connected = True
+
+    def skins_sent(self):
+        import json
+        return [json.loads(m)["skin"] for m in self.socket.sent if json.loads(m)["type"] == "skin"]
+
+    def test_alone_in_the_room_nothing_is_sent(self):
+        self.relay.members = [member(1, "Me")]
+        asyncio.run(self.relay.send_state({"skin_id": 103001}))
+        self.assertEqual(self.skins_sent(), [])
+
+    def test_a_friend_joining_gets_our_state(self):
+        import json
+        self.relay.members = [member(1, "Me")]
+        asyncio.run(self.relay.send_state({"skin_id": 103001}))
+        self.socket._incoming = [json.dumps({"type": "members", "members": [member(1, "Me"), member(2, "B")]})]
+
+        asyncio.run(self.relay._receive(self.socket))
+
+        self.assertEqual(self.skins_sent(), [{"skin_id": 103001}])
+
+    def test_the_same_state_is_not_sent_twice(self):
+        self.relay.members = [member(1, "Me"), member(2, "B")]
+        asyncio.run(self.relay.send_state({"skin_id": 103001}))
+        asyncio.run(self.relay.send_state({"skin_id": 103001}))
+        asyncio.run(self.relay.send_state({"skin_id": 103002}))
+        self.assertEqual(self.skins_sent(), [{"skin_id": 103001}, {"skin_id": 103002}])
+
+    def test_a_new_connection_gets_our_state_again(self):
+        self.relay.members = [member(1, "Me"), member(2, "B")]
+        asyncio.run(self.relay.send_state({"skin_id": 103001}))
+        self.relay._sent_state = None  # what _open does on a new connection
+        asyncio.run(self.relay._deliver_state())
+        self.assertEqual(self.skins_sent(), [{"skin_id": 103001}, {"skin_id": 103001}])
+
+
+class RelayReconnectTests(unittest.TestCase):
+    """Every connection wakes the room on the relay, which the relay pays for:
+    reconnecting stops instead of looping, until the party needs the room again."""
+
+    def setUp(self):
+        from party.network import ws_relay
+        self.module = ws_relay
+        self.relay = ws_relay.PartyRelay("a" * 32, 1, "Me")
+        self.clock = [0.0]
+        self.delays = []
+        self.opens = 0
+
+        async def sleep(seconds):
+            self.delays.append(seconds)
+            self.clock[0] += seconds
+
+        self.enterContext(patch.object(ws_relay.asyncio, "sleep", sleep))
+        self.enterContext(patch.object(ws_relay, "time", SimpleNamespace(monotonic=lambda: self.clock[0])))
+
+    def run_relay(self, connections, keepalive_ws=None):
+        """connections: one entry per attempt, None for a refused one, else
+        (seconds the connection lasts, reason it was closed with)."""
+        remaining = list(connections)
+
+        async def open_(timeout):
+            self.opens += 1
+            if not remaining:
+                self.relay._closing = True  # the test is over
+                return False
+            outcome = remaining.pop(0)
+            if outcome is None:
+                return False
+            self.relay._ws = SimpleNamespace(lasts=outcome[0], close_reason=outcome[1])
+            self.relay._connected = True
+            return True
+
+        async def receive(ws):
+            self.clock[0] += ws.lasts
+
+        async def keepalive(ws):
+            pass
+
+        self.relay._open = open_
+        self.relay._receive = receive
+        self.relay._keepalive = keepalive
+        asyncio.run(self.relay._run())
+
+    def test_replaced_by_another_connection_stops_reconnecting(self):
+        self.relay._ws = SimpleNamespace(lasts=5, close_reason="replaced")
+        self.relay._connected = True
+        self.run_relay([])
+        self.assertEqual(self.opens, 0)
+        self.assertTrue(self.relay.stopped)
+
+    def test_connections_that_drop_at_once_back_off_then_stop(self):
+        self.run_relay([(1, "")] * 10)
+        self.assertEqual(self.delays, list(self.module.RECONNECT_DELAYS))
+        self.assertEqual(self.opens, len(self.module.RECONNECT_DELAYS))
+        self.assertTrue(self.relay.stopped)
+
+    def test_refused_connections_stop_after_every_delay(self):
+        self.run_relay([None] * 10)
+        self.assertEqual(self.opens, len(self.module.RECONNECT_DELAYS))
+        self.assertTrue(self.relay.stopped)
+
+    def test_a_lasting_connection_starts_the_delays_over(self):
+        self.run_relay([(1, ""), (1, ""), (400, ""), (1, "")])
+        self.assertEqual(self.delays[:4], [1.0, 2.0, 5.0, 1.0])
+
+    def test_connections_cut_every_100s_back_off_then_stop(self):
+        # Cloudflare cuts a connection that carries nothing after 100s: pings
+        # that never get through must not keep a room waking up all day
+        self.run_relay([(100, "")] * 10)
+        self.assertEqual(self.delays, list(self.module.RECONNECT_DELAYS))
+        self.assertTrue(self.relay.stopped)
+
+    def test_a_full_room_stops_at_once(self):
+        async def open_(timeout):
+            self.opens += 1
+            self.relay._room_full = True
+            return False
+        self.relay._open = open_
+        asyncio.run(self.relay._run())
+        self.assertEqual(self.opens, 1)
+        self.assertTrue(self.relay.stopped)
+
+    def test_a_relay_asking_for_a_newer_rose_stops_at_once(self):
+        async def open_(timeout):
+            self.opens += 1
+            self.relay._update_required = True
+            return False
+        self.relay._open = open_
+        asyncio.run(self.relay._run())
+        self.assertEqual(self.opens, 1)
+        self.assertTrue(self.relay.stopped)
+
+    def test_the_update_refusal_says_so(self):
+        error = SimpleNamespace(status_code=426)
+        self.assertIn("update Rose", self.module._describe_error(error))
+
+    def test_resume_reconnects_a_stopped_room(self):
+        self.relay._stopped = True
+        run = Mock()
+        with patch.object(self.relay, "_run", run), patch.object(self.module.asyncio, "create_task"):
+            self.relay.resume()
+        run.assert_called_once()
+        self.assertFalse(self.relay.stopped)
+
+    def test_resume_leaves_a_live_room_alone(self):
+        with patch.object(self.module.asyncio, "create_task") as create_task:
+            self.relay.resume()
+        create_task.assert_not_called()
+
+
+class SkinBroadcastSettleTests(unittest.TestCase):
+    """Hovering skins in champ select doesn't send every second: a pick goes
+    out once it settles, and the pick our injection starts with at once."""
+
+    def run_loop(self, picks, frozen=False):
+        from party.core import party_manager as module
+        manager = PartyManager(Mock(), make_state())
+        manager._running = True
+        manager._skin_collector = Mock(is_frozen=Mock(return_value=frozen))
+        remaining = list(picks)
+        published = []
+        clock = [0.0]
+
+        def current():
+            if len(remaining) == 1:
+                manager._running = False
+            return remaining.pop(0)
+
+        async def publish():
+            published.append(manager._skin_state)
+
+        async def sleep(seconds):
+            clock[0] += seconds
+
+        manager._current_skin_state = current
+        manager._publish_state = publish
+        fake_time = SimpleNamespace(time=time.time, monotonic=lambda: clock[0])
+        with patch.object(module, "time", fake_time), patch.object(module.asyncio, "sleep", sleep):
+            asyncio.run(manager._skin_broadcast_loop())
+        return published
+
+    def test_hovering_sends_only_the_pick_that_settles(self):
+        a, b, c, d = ({"skin_id": 103000 + n} for n in range(1, 5))
+        self.assertEqual(self.run_loop([a, b, c, d, d, d]), [d])
+
+    def test_the_pick_our_injection_starts_with_goes_out_at_once(self):
+        a = {"skin_id": 103001}
+        self.assertEqual(self.run_loop([a], frozen=True), [a])
 
 
 class InjectionHookTests(unittest.TestCase):

@@ -10,11 +10,13 @@ import hashlib
 import json
 import os
 import ssl
+import time
 from typing import Callable, List, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from config import APP_VERSION
 from utils.core.logging import get_logger
 
 log = get_logger()
@@ -27,8 +29,18 @@ except ImportError:
 RELAY_URL = os.environ.get("ROSE_RELAY_URL", _CONFIGURED_URL)
 PING_INTERVAL = 25.0
 CONNECT_TIMEOUT = 15.0
-# Wait before each reconnect attempt, in seconds (the last delay repeats)
+# Wait before each reconnect attempt, in seconds
 RECONNECT_DELAYS = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0)
+# A connection that lasted this long was a working one: the next drop starts
+# the delays over. One dropped sooner keeps them growing. Well above the 100s
+# after which Cloudflare cuts a connection that carries nothing: a client whose
+# pings never get through (a firewall...) otherwise reconnected every 100s all day
+STABLE_CONNECTION_S = 300.0
+# The relay closes a connection with this reason when the same player joins the
+# room again: another connection (a second Rose, another PC) now has our place
+REPLACED_REASON = "replaced"
+# The relay refuses a Rose too old for it with this status: no point retrying
+UPDATE_REQUIRED_STATUS = 426
 
 _ssl_contexts_cache: Optional[List[ssl.SSLContext]] = None
 
@@ -60,15 +72,21 @@ def _ssl_contexts() -> List[ssl.SSLContext]:
     return _ssl_contexts_cache
 
 
+def _status_code(error: Optional[BaseException]) -> Optional[int]:
+    return getattr(error, "status_code", None) or getattr(getattr(error, "response", None), "status_code", None)
+
+
 def _describe_error(error: Optional[BaseException]) -> str:
     """Short, user-facing reason for a failed connection."""
     if error is None:
         return "unknown error"
     if isinstance(error, ssl.SSLCertVerificationError):
         return f"secure connection failed ({error.verify_message or error})"
-    status = getattr(error, "status_code", None) or getattr(getattr(error, "response", None), "status_code", None)
+    status = _status_code(error)
     if status == 409:
         return "this party is full (10 players max)"
+    if status == UPDATE_REQUIRED_STATUS:
+        return "this version of Rose is too old for party mode, please update Rose"
     if status:
         return f"the party server answered with HTTP {status}"
     if isinstance(error, asyncio.TimeoutError):
@@ -84,21 +102,35 @@ class PartyRelay:
     Members join, announce themselves, and broadcast their state (skin pick
     and the other rooms they are in). The Worker broadcasts the full member
     list on every change. A dropped connection is reopened in the background,
-    and our join and last state are sent again.
+    and our join and last state are sent again, until _run gives up.
+
+    Our state only goes out while someone else is in the room: every message
+    wakes the room on the relay, whose active time is what the relay pays for,
+    and a room with only us in it has no one to tell. It goes out as soon as
+    someone joins.
     """
 
     def __init__(self, room_key: str, summoner_id: int, summoner_name: str):
         self.room_key = room_key
+        self._summoner_id = summoner_id
         self._join_msg = {
             "type": "join",
             "summoner_id": summoner_id,
             "summoner_name": summoner_name,
         }
         self._state: Optional[dict] = None
+        # The state the room has for us on the current connection
+        self._sent_state: Optional[dict] = None
         self._ws = None
         self._connected = False
         self._closing = False
         self._run_task: Optional[asyncio.Task] = None
+        # Reconnecting stopped (see _run) until resume()
+        self._stopped = False
+        # The last connection attempt was refused because the room is full,
+        # or because the relay needs a newer Rose
+        self._room_full = False
+        self._update_required = False
 
         # Last member list received (kept while reconnecting)
         self.members: List[dict] = []
@@ -112,6 +144,11 @@ class PartyRelay:
     @property
     def connected(self) -> bool:
         return self._connected and self._ws is not None
+
+    @property
+    def stopped(self) -> bool:
+        """Reconnecting gave up; resume() starts it again."""
+        return self._stopped
 
     def set_callbacks(
         self,
@@ -137,14 +174,35 @@ class PartyRelay:
         self._run_task = asyncio.create_task(self._run())
         return True
 
+    def resume(self):
+        """Reconnect a room we stopped reconnecting to (at a moment the party
+        needs it: a lobby, a champ select, a friend added again)."""
+        if not self._stopped or self._closing:
+            return
+        self._stopped = False
+        log.info(f"[RELAY] Reconnecting to room {self.room_key[:8]}")
+        self._run_task = asyncio.create_task(self._run())
+
     async def send_state(self, state: Optional[dict]):
-        """Broadcast our state to the room (sent again after reconnects)."""
+        """Share our state with the room (again after reconnects, and when
+        someone joins a room we were alone in)."""
         self._state = state
+        await self._deliver_state()
+
+    def _others_present(self) -> bool:
+        return any(m.get("summoner_id") != self._summoner_id for m in self.members)
+
+    async def _deliver_state(self):
+        """Send our state if someone else is in the room and it doesn't have it yet."""
         ws = self._ws
-        if ws is None or not self._connected:
+        if ws is None or not self._connected or not self._others_present():
+            return
+        state = self._state
+        if state == self._sent_state:
             return
         try:
             await ws.send(json.dumps({"type": "skin", "skin": state}))
+            self._sent_state = state
         except ConnectionClosed:
             pass  # _run notices the drop and reconnects
 
@@ -184,7 +242,10 @@ class PartyRelay:
             log.warning("[RELAY] No relay URL configured")
             return False
 
-        url = f"{RELAY_URL}/room?key={self.room_key}"
+        # The version tells the relay's logs which Rose a looping connection comes from
+        url = f"{RELAY_URL}/room?key={self.room_key}&v={APP_VERSION}"
+        self._room_full = False
+        self._update_required = False
         contexts = _ssl_contexts() if url.startswith("wss://") else [None]
         error: Optional[BaseException] = None
 
@@ -202,39 +263,56 @@ class PartyRelay:
                 break
 
             try:
+                # Our state follows once the room's member list shows someone else
                 await ws.send(json.dumps(self._join_msg))
-                if self._state is not None:
-                    await ws.send(json.dumps({"type": "skin", "skin": self._state}))
             except Exception as e:
                 error = e
                 break
 
             self._ws = ws
             self._connected = True
+            self._sent_state = None  # a new connection starts without our state
             self.last_error = None
             log.info(f"[RELAY] Connected to room {self.room_key[:8]}")
             self._notify(self._on_connection_changed)
             return True
 
         self.last_error = _describe_error(error)
+        self._room_full = _status_code(error) == 409
+        self._update_required = _status_code(error) == UPDATE_REQUIRED_STATUS
         log.warning(f"[RELAY] Connection to room {self.room_key[:8]} failed: {error}")
         return False
 
     async def _run(self):
-        """Receive room updates; reopen the connection whenever it drops."""
+        """Receive room updates; reopen the connection when it drops.
+
+        Every connection wakes the room on the relay, which the relay pays for,
+        so this gives up (until resume()) rather than retry forever: when the
+        relay handed our place to another connection of ours, when the room is
+        full, and after trying every delay without getting a connection that
+        lasts.
+        """
         attempt = 0
         while not self._closing:
             if self._ws is None:
-                delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
-                await asyncio.sleep(delay)
+                if attempt >= len(RECONNECT_DELAYS):
+                    self._stop(f"no lasting connection after {attempt} attempts")
+                    return
+                await asyncio.sleep(RECONNECT_DELAYS[attempt])
+                attempt += 1
                 if self._closing:
                     return
                 if not await self._open(CONNECT_TIMEOUT):
-                    attempt += 1
+                    if self._room_full:
+                        self._stop("the room is full")
+                        return
+                    if self._update_required:
+                        self._stop("the party server needs a newer Rose")
+                        return
                     continue
-                attempt = 0
 
             ws = self._ws
+            opened_at = time.monotonic()
             keepalive = asyncio.create_task(self._keepalive(ws))
             try:
                 await self._receive(ws)
@@ -245,8 +323,18 @@ class PartyRelay:
                 return
             self._ws = None
             self._connected = False
+            if getattr(ws, "close_reason", None) == REPLACED_REASON:
+                self._stop("this account joined it from another connection")
+                return
+            if time.monotonic() - opened_at >= STABLE_CONNECTION_S:
+                attempt = 0
             log.info(f"[RELAY] Lost connection to room {self.room_key[:8]}, reconnecting...")
             self._notify(self._on_connection_changed)
+
+    def _stop(self, reason: str):
+        self._stopped = True
+        log.info(f"[RELAY] Stopped reconnecting to room {self.room_key[:8]}: {reason}")
+        self._notify(self._on_connection_changed)
 
     async def _receive(self, ws):
         try:
@@ -262,6 +350,7 @@ class PartyRelay:
                     members = msg.get("members")
                     self.members = [m for m in members if isinstance(m, dict)] if isinstance(members, list) else []
                     log.debug(f"[RELAY] Room {self.room_key[:8]}: {len(self.members)} member(s)")
+                    await self._deliver_state()
                     self._notify(self._on_members_changed)
         except ConnectionClosed as e:
             log.info(f"[RELAY] Room {self.room_key[:8]} connection closed: {e}")
