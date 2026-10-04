@@ -54,6 +54,9 @@ Name: "quicklaunchicon"; Description: "{cm:CreateQuickLaunchIcon}"; GroupDescrip
 ; Main application files
 ; hashes.game.txt is user-managed and must be preserved across installations.
 Source: "dist\Rose\*"; DestDir: "{app}"; Excludes: "injection\tools\hashes.game.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Bundle LTK patcher files directly into the installation directory
+Source: "injection\tools\ltk_patcher_host.exe"; DestDir: "{app}\injection\tools"; Flags: ignoreversion
+Source: "injection\tools\ltk_patcher_dll.dll"; DestDir: "{app}\injection\tools"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
