@@ -36,6 +36,8 @@ import os
 injection_binaries = [
     'injection/tools/mod-tools.exe',
     'injection/tools/cslol-dll.dll',  # Rose's stand-in, built from native/cslol_stub
+    'injection/tools/ltk_patcher_host.exe',
+    'injection/tools/ltk_patcher_dll.dll',
 ]
 # Data files (text files, etc.)
 injection_data_files = [
@@ -411,8 +413,8 @@ a = Analysis(
     noarchive=False,
 )
 
-# Remove user-provided patcher binaries if PyInstaller auto-detected them
-a.binaries = filter_binaries(a.binaries)
+# Retain all binaries
+a.binaries = a.binaries
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
