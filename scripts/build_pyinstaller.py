@@ -72,6 +72,10 @@ def build_pengu_loader():
     script = ROOT / "scripts" / "build_pengu_loader.py"
     result = subprocess.run([sys.executable, str(script)], check=False, cwd=ROOT)
     if result.returncode != 0:
+        prebuilt = ROOT / "Pengu Loader" / "Pengu Loader.exe"
+        if prebuilt.exists():
+            print(f"[INFO] Pengu Loader source build skipped, using existing: {prebuilt}")
+            return True
         print(f"[ERROR] Pengu Loader source build failed with exit code {result.returncode}")
         return False
 

@@ -2,7 +2,7 @@
 ; This creates a proper Windows installer that registers the app
 
 #define MyAppName "Rose"
-#define MyAppVersion "1.4.6-custom-0.1"
+#define MyAppVersion "1.4.6.1-custom"
 #define MyAppVersionInfo "1.4.6.1"
 #define MyAppPublisher "Rose Team"
 #define MyAppURL "https://github.com/Alban1911/Rose"
@@ -54,7 +54,9 @@ Name: "quicklaunchicon"; Description: "{cm:CreateQuickLaunchIcon}"; GroupDescrip
 ; Main application files
 ; hashes.game.txt is user-managed and must be preserved across installations.
 Source: "dist\Rose\*"; DestDir: "{app}"; Excludes: "injection\tools\hashes.game.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Bundle LTK patcher files directly into the installation directory
+; Bundle injection tools directly into the installation directory
+Source: "injection\tools\mod-tools.exe"; DestDir: "{app}\injection\tools"; Flags: ignoreversion
+Source: "injection\tools\cslol-dll.dll"; DestDir: "{app}\injection\tools"; Flags: ignoreversion
 Source: "injection\tools\ltk_patcher_host.exe"; DestDir: "{app}\injection\tools"; Flags: ignoreversion
 Source: "injection\tools\ltk_patcher_dll.dll"; DestDir: "{app}\injection\tools"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
@@ -104,6 +106,53 @@ begin
     { If WMI fails, don't block the uninstall }
     Result := False;
   end;
+end;
+
+function InitializeSetup(): Boolean;
+var
+  RoseRunning: Boolean;
+  LeagueRunning: Boolean;
+begin
+  RoseRunning := CheckForMutexes('{#MyAppMutex}');
+  LeagueRunning := _IsLeagueRunning();
+
+  if RoseRunning and LeagueRunning then
+  begin
+    MsgBox(
+      '{#MyAppName} and League of Legends are both currently running.'#13#10 +
+      'Please close both applications and try installing again.',
+      mbCriticalError,
+      MB_OK
+    );
+    Result := False;
+    exit;
+  end;
+
+  if RoseRunning then
+  begin
+    MsgBox(
+      '{#MyAppName} is currently running.'#13#10 +
+      'Please close it completely (including the tray) and try installing again.',
+      mbCriticalError,
+      MB_OK
+    );
+    Result := False;
+    exit;
+  end;
+
+  if LeagueRunning then
+  begin
+    MsgBox(
+      'League of Legends is currently running.'#13#10 +
+      'Please close League of Legends and try installing again.',
+      mbCriticalError,
+      MB_OK
+    );
+    Result := False;
+    exit;
+  end;
+
+  Result := True;
 end;
 
 function InitializeUninstall(): Boolean;
@@ -270,6 +319,11 @@ begin
   begin
     { Clean up a dead hook left by an older Rose uninstall }
     _RemoveDeadPenguIfeo();
+
+    { Clean up any leftover version.dll created by older symlink mode }
+    DeleteFile('C:\Riot Games\League of Legends\version.dll');
+    DeleteFile('D:\Riot Games\League of Legends\version.dll');
+    DeleteFile('E:\Riot Games\League of Legends\version.dll');
 
     // Create registry entries for Windows Apps list
     RegWriteStringValue(HKEY_LOCAL_MACHINE, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppName}', 'DisplayName', '{#MyAppName}');

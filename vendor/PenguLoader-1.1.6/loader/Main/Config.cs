@@ -64,7 +64,7 @@ namespace PenguLoader.Main
 
         public static bool UseSymlink
         {
-            get => GetBool("UseSymlink", true);
+            get => GetBool("UseSymlink", false);
             set => SetBool("UseSymlink", value);
         }
 
