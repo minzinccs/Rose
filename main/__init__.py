@@ -659,6 +659,29 @@ def main() -> None:
     if not _check_dll_present():
         sys.exit(1)
 
+    # Clean up any leftover version.dll in League directory that causes Entry Point Not Found
+    if sys.platform == "win32":
+        try:
+            from config import get_config_option
+            cfg_client = get_config_option("General", "clientPath")
+            cfg_league = get_config_option("General", "leaguePath")
+            target_dirs = set()
+            for p in (cfg_client, cfg_league):
+                if p:
+                    target_dirs.add(Path(p))
+                    target_dirs.add(Path(p).parent)
+            for drive in ("C", "D", "E", "F"):
+                target_dirs.add(Path(f"{drive}:/Riot Games/League of Legends"))
+            for tdir in target_dirs:
+                vfile = tdir / "version.dll"
+                if vfile.exists():
+                    try:
+                        vfile.unlink()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
     run_league_unlock(args=args)
 
 
