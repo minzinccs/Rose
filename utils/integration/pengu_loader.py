@@ -292,6 +292,20 @@ def _resolve_pengu_dir() -> Path:
                 shutil.copy2(bundled_datastore, runtime_datastore)
             except Exception as exc:
                 log.debug("Failed to seed Pengu Loader datastore: %s", exc)
+        # Enforce UseSymlink=false in the runtime directory config file
+        runtime_config = runtime_dir / "config"
+        try:
+            config_lines = []
+            if runtime_config.exists():
+                for line in runtime_config.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.strip().lower().startswith("usesymlink="):
+                        continue
+                    config_lines.append(line)
+            config_lines.append("UseSymlink=false")
+            runtime_config.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+        except Exception as exc:
+            log.debug("Failed to enforce UseSymlink=false in runtime config: %s", exc)
+
         log.info("Synced Pengu Loader to runtime directory (preserving user files): %s", runtime_dir)
 
         # Restore plugin enable/disable state after the overlay sync.
@@ -491,6 +505,13 @@ def set_league_path(league_path: str) -> bool:
         log.warning('Empty League path provided; skipping --set-league-path.')
         return False
     path = league_path.strip()
+    # Ensure any stray version.dll is removed from League path
+    try:
+        stray = Path(path) / "version.dll"
+        if stray.exists():
+            stray.unlink()
+    except Exception:
+        pass
     log.info('Setting League path: executable=%s league_path=%s', PENGU_EXE, path)
     with _operation_lock:
         return _run_cli(['--set-league-path', path, '--silent'])

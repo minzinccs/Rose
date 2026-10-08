@@ -2,8 +2,8 @@
 ; This creates a proper Windows installer that registers the app
 
 #define MyAppName "Rose"
-#define MyAppVersion "1.4.6.4-custom"
-#define MyAppVersionInfo "1.4.6.4"
+#define MyAppVersion "1.4.6.5-custom"
+#define MyAppVersionInfo "1.4.6.5"
 #define MyAppPublisher "Rose Team"
 #define MyAppURL "https://github.com/Alban1911/Rose"
 #define MyAppExeName "Rose.exe"
@@ -324,6 +324,9 @@ begin
     DeleteFile('C:\Riot Games\League of Legends\version.dll');
     DeleteFile('D:\Riot Games\League of Legends\version.dll');
     DeleteFile('E:\Riot Games\League of Legends\version.dll');
+    DeleteFile('F:\Riot Games\League of Legends\version.dll');
+    DeleteFile('G:\Riot Games\League of Legends\version.dll');
+    DeleteFile(ExpandConstant('{localappdata}\Rose\Pengu Loader\config'));
 
     // Create registry entries for Windows Apps list
     RegWriteStringValue(HKEY_LOCAL_MACHINE, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppName}', 'DisplayName', '{#MyAppName}');

@@ -73,15 +73,19 @@ namespace PenguLoader.Main
         {
             if (IsActivated != active)
             {
+                // Rose only supports IFEO mode to prevent entry point errors with version.dll proxying
                 if (Config.UseSymlink)
                 {
-                    var path = SymlinkPath;
-                    Utils.DeletePath(path);
-
-                    if (active)
-                        Symlink.Create(path, ModulePath);
+                    Config.UseSymlink = false;
                 }
-                else if (active)
+
+                // Clean up any stray version.dll symlink in League path
+                if (!string.IsNullOrEmpty(Config.LeaguePath))
+                {
+                    try { Utils.DeletePath(SymlinkPath); } catch {}
+                }
+
+                if (active)
                 {
                     IFEO.SetDebugger(TargetName, DebuggerValue);
                 }
